@@ -25,15 +25,26 @@ state_dict = torch.load("/modproject/gemma3_4b_it_bfloat16_correct.pth", map_loc
 model.load_state_dict(state_dict)
 model.eval()
 model_head.eval()
-prompt = "我壓力真的好大，怎麼辦!請簡短安慰我就好不要給我建議。"
-inputs = processor(prompt, return_tensors="pt")
+messages = [
+    [
+        {
+            "role": "system",
+            "content": [{"type": "text", "text": "You are a helpful assistant."},]
+        },
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "我壓力真的好大...請簡短安慰我就好不要給我建議。"},]
+        },
+    ],
+]
+inputs = processor.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt", return_dict=True)
 inputs = {k: v.to("cuda:0") for k, v in inputs.items()}
 all_output_ids = []
 client_cache = None
 server_cache = None
 in_ids = inputs["input_ids"]
 position_ids = torch.arange(in_ids.shape[1], device=in_ids.device).unsqueeze(0)
-for i in range(100):
+for i in range(400):
     output = model_head(
         input_ids=in_ids,
         position_ids=position_ids,
