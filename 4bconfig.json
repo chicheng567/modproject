@@ -2,7 +2,7 @@
   "return_dict": true,
   "output_hidden_states": false,
   "torchscript": false,
-  "torch_dtype": "float32",
+  "torch_dtype": "bfloat16",
   "use_bfloat16": false,
   "tf_legacy_loss": false,
   "pruned_heads": {},
