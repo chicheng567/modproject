@@ -1,14 +1,10 @@
-"""
-獨立的 Gemma3 12B 模型實現
-可以從 .pt 權重檔案加載，並重現原始 Gemma3 12B 的功能
-"""
 import torch
 import torch.nn as nn
 from transformers.utils import ModelOutput, auto_docstring, can_return_tuple, is_torchdynamo_compiling, logging
 from transformers.utils.deprecation import deprecate_kwarg
 from dataclasses import dataclass
-from transformers.models.gemma3.configuration_gemma3 import Gemma3TextConfig
-from transformers.models.gemma3.modeling_gemma3 import *
+from transformers.models.llama.configuration_llama import LlamaConfig
+from transformers.models.llama.modeling_llama import *
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from typing import Optional, Tuple, Union, List
 from transformers.processing_utils import Unpack
@@ -16,10 +12,10 @@ from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.generation.logits_process import TopKLogitsWarper
-from transformers.models.gemma3.modeling_gemma3 import Gemma3TextScaledWordEmbedding, Gemma3RMSNorm, Gemma3DecoderLayer, Gemma3RotaryEmbedding
+from transformers.models.llama.modeling_llama import LlamaRMSNorm, LlamaDecoderLayer, LlamaRotaryEmbedding
 import copy
-class Gemma3TextModelHeadless(Gemma3TextModel):
-    def __init__(self, config: Gemma3TextConfig):
+class LlamaTextModelHeadless(LlamaModel):
+    def __init__(self, config: LlamaConfig):
         super().__init__(config)
         
     @can_return_tuple
@@ -58,35 +54,26 @@ class Gemma3TextModelHeadless(Gemma3TextModel):
             )
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
-        if not isinstance(causal_mask_mapping := attention_mask, dict):
-            # Prepare mask arguments
-            mask_kwargs = {
-                "config": self.config,
-                "input_embeds": inputs_embeds,
-                "attention_mask": attention_mask,
-                "cache_position": cache_position,
-                "past_key_values": past_key_values,
-            }
-            # Create the masks
-            causal_mask_mapping = {
-                "full_attention": create_causal_mask(**mask_kwargs),
-                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
-            }
+        causal_mask = create_causal_mask(
+            config=self.config,
+            input_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            past_key_values=past_key_values,
+        )
         # embed positions
         hidden_states = inputs_embeds
-        position_embeddings_global = self.rotary_emb(hidden_states, position_ids)
-        position_embeddings_local = self.rotary_emb_local(hidden_states, position_ids)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
         for decoder_layer in self.layers[skip_layers: self.config.num_hidden_layers]:
             layer_outputs = decoder_layer(
                 hidden_states,
-                position_embeddings_global=position_embeddings_global,
-                position_embeddings_local=position_embeddings_local,
-                attention_mask=causal_mask_mapping[decoder_layer.attention_type],
+                attention_mask=causal_mask,
                 position_ids=position_ids,
                 output_attentions=output_attentions,
                 past_key_value=past_key_values,
                 use_cache=use_cache,
                 cache_position=cache_position,
+                position_embeddings=position_embeddings,
                 **flash_attn_kwargs,
             )
             hidden_states = layer_outputs[0]
@@ -98,11 +85,11 @@ class Gemma3TextModelHeadless(Gemma3TextModel):
             attentions=None,
         )
 
-class Gemma3ForCausalLMHeadless(nn.Module):
-    def __init__(self, config: Gemma3TextConfig):
+class LlamaForCausalLMHeadless(nn.Module):
+    def __init__(self, config: LlamaConfig):
         super().__init__()
         self.config = config
-        self.model = Gemma3TextModelHeadless(config)
+        self.model = LlamaTextModelHeadless(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.top_k_warper = TopKLogitsWarper(top_k=config.top_k)
@@ -130,7 +117,9 @@ class Gemma3ForCausalLMHeadless(nn.Module):
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         if skip_layers > 0:
             assert inputs_embeds is not None, "inputs_embeds must be provided when skip_layers > 0"
-
+        assert attention_mask is not None, "attention_mask must be provided"
+        assert position_ids is not None, "position_ids must be provided"
+        assert cache_position is not None, "cache_position must be provided"
         outputs: BaseModelOutputWithPast = self.model(
             skip_layers=skip_layers,
             input_ids=input_ids,
@@ -148,31 +137,23 @@ class Gemma3ForCausalLMHeadless(nn.Module):
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
         logits = logits.view(-1, self.vocab_size)
-        if self.config.final_logit_softcapping is not None:
-            logits = logits / self.config.final_logit_softcapping
-            logits = torch.tanh(logits)
-            logits = logits * self.config.final_logit_softcapping
+        
 
         output_ids = self._sample(logits, self.config.temperature)
         return output_ids, past_key_values
 
-class Gemma3Head(nn.Module):
-    def __init__(self, config: Gemma3TextConfig):
+class LlamaHead(nn.Module):
+    def __init__(self, config: LlamaConfig):
         super().__init__()
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         # Gemma3 downcasts the below to bfloat16, causing sqrt(3072)=55.4256 to become 55.5. See https://github.com/huggingface/transformers/pull/29402
-        self.embed_tokens = Gemma3TextScaledWordEmbedding(
-            config.vocab_size, config.hidden_size, self.padding_idx, embed_scale=self.config.hidden_size**0.5
-        )
-        self.norm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.first_layer = Gemma3DecoderLayer(config, layer_idx=0)
-        self.rotary_emb = Gemma3RotaryEmbedding(config=config)
-        config = copy.deepcopy(config)
-        config.rope_theta = config.rope_local_base_freq
-        config.rope_scaling = {"rope_type": "default"}
-        self.rotary_emb_local = Gemma3RotaryEmbedding(config=config)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.first_layer = LlamaDecoderLayer(config, layer_idx=0)
+        self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        
     @torch.no_grad()
     def forward(
         self,
@@ -193,37 +174,28 @@ class Gemma3Head(nn.Module):
         inputs_embeds = self.embed_tokens(input_ids)
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache()
+        causal_mask = create_causal_mask(
+            config=self.config,
+            input_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            past_key_values=past_key_values,
+        )
         
-        if not isinstance(causal_mask_mapping := attention_mask, dict):
-            # Prepare mask arguments
-            mask_kwargs = {
-                "config": self.config,
-                "input_embeds": inputs_embeds,
-                "attention_mask": attention_mask,
-                "cache_position": cache_position,
-                "past_key_values": past_key_values,
-            }
-            # Create the masks
-            causal_mask_mapping = {
-                "full_attention": create_causal_mask(**mask_kwargs),
-                "sliding_attention": create_sliding_window_causal_mask(**mask_kwargs),
-            }
         # embed positions
         hidden_states = inputs_embeds
 
         # create position embeddings to be shared across the decoder layers
-        position_embeddings_global = self.rotary_emb(hidden_states, position_ids)
-        position_embeddings_local = self.rotary_emb_local(hidden_states, position_ids)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
         layer_outputs = self.first_layer(
             hidden_states,
-            position_embeddings_global=position_embeddings_global,
-            position_embeddings_local=position_embeddings_local,
-            attention_mask=causal_mask_mapping[self.first_layer.attention_type],
+            attention_mask=causal_mask,
             position_ids=position_ids,
             output_attentions=output_attentions,
             past_key_value=past_key_values,
             use_cache=use_cache,
             cache_position=cache_position,
+            position_embeddings=position_embeddings,
             **flash_attn_kwargs,
         )
         hidden_states = layer_outputs[0]
